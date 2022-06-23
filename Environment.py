@@ -9,7 +9,7 @@ import astar
 import copy
 import time
 
-device = 'cuda'
+device = 'cpu'
 
 c_Blue = torch.tensor((0,0,255)).to(device)         # obastacle
 c_Red = torch.tensor((255,0,0)).to(device)          # agent
@@ -17,7 +17,8 @@ c_Green = torch.tensor((0,255,0)).to(device)        # target
 c_Purple = torch.tensor((255,0,204)).to(device)     # other agent
 c_Black = torch.tensor((0,0,0)).to(device)          # waypoint
 c_White = torch.tensor((255,255,255)).to(device)
-c_Gray_Arr = torch.tensor(np.array(range(1,11))*15).to(device)
+
+c_Gray_Arr = [180, 160, 140, 120, 100, 80, 60, 40, 20, 0]
 
 class Agent:
     def __init__(self, x, y, target_x, target_y):
@@ -33,6 +34,11 @@ class Agent:
         self.id             = -1
         self.local_map      = []
         self.history        = []
+        self.action         = -1
+        self.state          = []
+        self.next_state     = []
+        self.score          = 0
+        
         
 
 class Env:
@@ -43,14 +49,17 @@ class Env:
         self.world_x            = 50
         self.world_y            = 50
         
-        self.local_size         = 11
+        self.local_size         = 15
         self.side_size          = 10
         self.mask_img           = torch.from_numpy(np.ones((self.world_x + self.side_size * 2, self.world_y + self.side_size * 2, 3)) * 255).to(device)
         
-        self.num_agent          = 50
+        self.num_agent          = 1
         self.agent_list         = []
         self.obs_list           = []
         self.overall_map        = []
+        
+        self.state_size         = (self.local_size, self.local_size, 5)
+        self.action_size        = 9
         
         self.fig = plt.figure()
         plt.subplot(2,2,1)
@@ -69,7 +78,7 @@ class Env:
         self.complement_map = copy.deepcopy(self.overall_map)
         self.step_count = 0
         
-    def env_reset(self):
+    def env_init(self):
         self.step_count = 0
         self.obs_list = []
         
@@ -95,7 +104,8 @@ class Env:
     def plannar_init(self):
         self.a_star = astar.AStarPlanner(np.array(self.obs_list)[:,0], np.array(self.obs_list)[:,1], self.grid_size, self.robot_radius)
 
-    def create_agent(self):
+    def env_reset(self):
+        self.agent_list = []
         random_position = random.sample(self.complement_map, self.num_agent * 2)
         for i in range(self.num_agent):
             agent = Agent(random_position[i][0],random_position[i][1],
@@ -103,6 +113,47 @@ class Env:
             agent.global_path = self.a_star.planning(agent.x, agent.y, agent.target_x, agent.target_y)
             agent.id = i
             self.agent_list.append(agent)
+            
+        for agent in self.agent_list:
+            agent.history.append([agent.x, agent.y])
+            agent.local_map = torch.from_numpy(np.ones((self.local_size, self.local_size, 5)) * 255).to(device)
+            temp_mask_img = torch.from_numpy(np.ones((self.world_x + self.side_size * 2, self.world_y + self.side_size * 2, 3)) * 255).to(device)
+            temp_mask_img_his = torch.from_numpy(np.ones((self.world_x + self.side_size * 2, self.world_y + self.side_size * 2, 1)) * 255).to(device)
+            temp_mask_img_way = torch.from_numpy(np.ones((self.world_x + self.side_size * 2, self.world_y + self.side_size * 2, 1)) * 255).to(device)
+            
+            for obs in self.obs_list: 
+                temp_mask_img[obs[0] + self.side_size, obs[1] + self.side_size, :] = c_Blue
+                
+            for agent_ in self.agent_list:
+                if agent.id != agent_.id:
+                    temp_mask_img[agent_.x + self.side_size, agent_.y + self.side_size, :] = c_Purple
+                    
+            temp_mask_img[agent.x + self.side_size, agent.y + self.side_size, :] = c_Red
+            temp_mask_img_his[agent.x + self.side_size, agent.y + self.side_size, :] = 0
+            temp_mask_img[agent.target_x + self.side_size, agent.target_y + self.side_size, :] = c_Green
+            
+            for history_xy in reversed(agent.history):
+                temp_mask_img_his[history_xy[0] + self.side_size, history_xy[1] + self.side_size, :] = 0
+    
+            way_ts = np.transpose(agent.global_path)
+            diff_way = np.abs(way_ts - np.array([agent.x, agent.y]))
+            diff_way_norm = np.linalg.norm(diff_way, axis=1)
+            start_id = diff_way_norm.argmin()
+            
+            current_way = way_ts[:start_id]
+
+            for way_xy in current_way:
+                temp_mask_img_way[int(way_xy[0] + self.side_size), int(way_xy[1] + self.side_size), 0] = 0
+                
+            start_x = int(agent.x + self.side_size-self.local_size/2) + 1
+            start_y = int(agent.y + self.side_size-self.local_size/2) + 1
+
+            agent.local_map[:,:,0:3] = temp_mask_img[start_x: start_x+ self.local_size,start_y:start_y+self.local_size,:]
+            agent.local_map[:,:,3] = temp_mask_img_his[start_x: start_x+ self.local_size,start_y:start_y+self.local_size,0]
+            agent.local_map[:,:,4] = temp_mask_img_way[start_x: start_x+ self.local_size,start_y:start_y+self.local_size,0]
+
+            
+        
         
     def heuristic_move(self, event):
         if event.key == "up":
@@ -117,14 +168,14 @@ class Env:
         if event.key == "right":
             self.agent_list[0].x += 1
     
-    def step(self, action_fun):
+    def step(self):
         
         for agent in self.agent_list:
-            if len(agent.history) > 10:
+            if len(agent.history) > 9:
                 agent.history.pop(0)
             agent.history.append([agent.x, agent.y])
 
-            action = action_fun()
+            action = agent.action
             # if agent.id == 0:
             #     action = -1
                 
@@ -138,7 +189,7 @@ class Env:
             9 discrete actions
             """
             
-            agent.reward -= 0.1
+            agent.reward -= 0.01
             if action == 0:
                 agent.x += 1
             elif action == 1:
@@ -163,7 +214,7 @@ class Env:
             elif action == 8:
                 agent.x += 0
                 agent.y += 0
-                agent.reward -= 0.4
+                agent.reward -= 0.01
             
             """
             --------------------
@@ -191,11 +242,11 @@ class Env:
             temp_mask_img_his[agent.x + self.side_size, agent.y + self.side_size, :] = 0
             temp_mask_img[agent.target_x + self.side_size, agent.target_y + self.side_size, :] = c_Green
             
-            
-            gray_his = 0
-            for history_xy in reversed(agent.history):
-                gray_his += 20
-                temp_mask_img_his[history_xy[0] + self.side_size, history_xy[1] + self.side_size, :] = gray_his
+            gray_c_arr = c_Gray_Arr[10 - len(agent.history):]
+            gray_idx = 0
+            for history_xy in agent.history:
+                temp_mask_img_his[history_xy[0] + self.side_size, history_xy[1] + self.side_size, :] = gray_c_arr[gray_idx]
+                gray_idx += 1
     
             way_ts = np.transpose(agent.global_path)
             diff_way = np.abs(way_ts - np.array([agent.x, agent.y]))
@@ -234,7 +285,7 @@ class Env:
                 if((agent.id != agent_.id) and ([agent.x, agent.y] == [agent_.x, agent_.y])):
                     # if agent.id == 0:
                     #     print("agent collision!")
-                    agent.reward -= 5
+                    agent.reward -= 1
                     agent.done = 1
                     # print("agent collision!")
                     
@@ -242,22 +293,23 @@ class Env:
             if [agent.x, agent.y] in self.occupy_map:
                 # if agent.id == 0:
                     # print("obastacle collision!")
-                agent.reward -= 5
+                agent.reward -= 1
                 agent.done = 1
             
             ## reach goal reward
             if [agent.x, agent.y] == [agent.target_x, agent.target_y]:
                 if agent.id == 0:
                     print("goal!")
-                agent.reward += 30
+                agent.reward += 3
                 agent.done = 1
             
             ## waypoint reward
-            agent.reward -= diff_way_norm.min()
+            agent.reward -= 0.1 * diff_way_norm.min()
             # if agent.id == 0:
             #     print(agent.reward)
                 
         self.step_count += 1
+
 
     
     def done_check(self):
